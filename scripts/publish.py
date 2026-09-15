@@ -27,7 +27,11 @@ for asset in assets:
     name = asset['FileName']
     if Path(name).name != name or '/' in name or '\\' in name:
         raise ValueError('Invalid package name')
-    if asset['Version'] != version or asset['PackageId'] != 'Fumbler':
+    # Must match Brand.UpdatePackageId in the Windows app and the --packId that
+    # package-release.ps1 reads from it. It is deliberately not "Fumbler": that
+    # is the user's data folder, and Velopack empties its own install directory
+    # on every update, which is how 0.7.5 deleted people's settings and media.
+    if asset['Version'] != version or asset['PackageId'] != 'FumblerApp':
         raise ValueError('Windows package version mismatch')
     data = (folder / name).read_bytes()
     if hashlib.sha256(data).hexdigest().lower() != asset['SHA256'].lower():
