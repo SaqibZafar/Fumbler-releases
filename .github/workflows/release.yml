@@ -126,6 +126,18 @@ jobs:
           bash build.sh "$TARGET" --test > build-log.txt 2>&1
           mkdir -p Releases
           ditto -c -k --sequesterRsrc --keepParent "build/Fumbler-$LABEL.app" "Releases/Fumbler-$VERSION-mac-$LABEL.zip"
+      - name: Summarise the macOS checks
+        if: always()
+        run: |
+          # This port has no developer Mac behind it, so these runners are the
+          # only place its self-test ever executes. Print the result either way.
+          if [ -f build-log.txt ]; then
+            echo "===== build-log.txt (tail) ====="
+            tail -40 build-log.txt
+          fi
+          for report in test-results/results.txt; do
+            [ -f "$report" ] && { echo "===== $report ====="; grep -E '^(FAIL|Failures:|Checks:|Scope:)' "$report" || true; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: mac-release-${{ matrix.arch }}
