@@ -69,6 +69,23 @@ jobs:
           if ($test.ExitCode -ne 0) { throw 'Updater tests failed; reproduce in the private Windows repository.' }
           dotnet tool install --tool-path .tools/vpk vpk --version 1.2.0
           ./package-release.ps1 -Vpk "$PWD/.tools/vpk/vpk.exe" *> package-log.txt
+      - name: Surface failing checks
+        if: failure()
+        shell: pwsh
+        run: |
+          # The runner has no audio hardware and no VB-CABLE, so a failure here
+          # is often environmental rather than a real regression. Print enough
+          # to tell the two apart without republishing private source.
+          foreach ($report in 'test-results/results.txt','test-results/update-results.txt') {
+            if (Test-Path $report) {
+              Write-Host "===== $report ====="
+              Get-Content $report | Select-String -Pattern '^(FAIL|Failures:|Scope:)' | ForEach-Object { $_.Line }
+            }
+          }
+          if (Test-Path build-log.txt) {
+            Write-Host '===== build-log.txt (tail) ====='
+            Get-Content build-log.txt -Tail 40
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-release
