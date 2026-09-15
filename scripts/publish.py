@@ -1,0 +1,94 @@
+"""Sign immutable packages, upload to a draft, then expose one complete release."""
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import xml.etree.ElementTree as ET
+import zipfile
+import plistlib
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding
+
+repo = 'SaqibZafar/Fumbler-releases'
+version = os.environ['VERSION']
+if not re.fullmatch(r'0\.7\.(0|[1-9][0-9]*)', version):
+    raise ValueError('Invalid version')
+folder = Path('release-assets')
+base = f'https://github.com/{repo}/releases/download/v{version}/'
+feed_path = folder / 'releases.win.json'
+feed = json.loads(feed_path.read_text())
+assets = feed['Assets']
+if not assets:
+    raise ValueError('Windows feed is empty')
+for asset in assets:
+    name = asset['FileName']
+    if Path(name).name != name or '/' in name or '\\' in name:
+        raise ValueError('Invalid package name')
+    if asset['Version'] != version or asset['PackageId'] != 'Fumbler':
+        raise ValueError('Windows package version mismatch')
+    data = (folder / name).read_bytes()
+    if hashlib.sha256(data).hexdigest().lower() != asset['SHA256'].lower():
+        raise ValueError('Windows package checksum mismatch')
+    asset['FileName'] = base + name
+payload = json.dumps(feed, separators=(',', ':')).encode()
+key = serialization.load_pem_private_key(os.environ['WINDOWS_UPDATE_PRIVATE_KEY'].encode(), password=None)
+signature = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+(folder / 'releases.win.signed.json').write_text(json.dumps({'payload': base64.b64encode(payload).decode(), 'signature': base64.b64encode(signature).decode()}))
+# The unsigned Velopack index is retained for diagnostics only. The app never consumes it.
+feed_path.write_bytes(payload)
+sparkle_key = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(os.environ['SPARKLE_PRIVATE_KEY']))
+sparkle_public = base64.b64encode(sparkle_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+namespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+ET.register_namespace('sparkle', namespace)
+for arch, label in [('arm64', 'apple-silicon'), ('x86_64', 'intel')]:
+    name = f'Fumbler-{version}-mac-{label}.zip'
+    path = folder / name
+    with zipfile.ZipFile(path) as archive:
+        plist = plistlib.loads(archive.read(f'Fumbler-{label}.app/Contents/Info.plist'))
+        if plist['CFBundleVersion'] != version or plist['SUPublicEDKey'] != sparkle_public:
+            raise ValueError('Mac version or embedded signing key mismatch')
+        if plist['LSArchitecturePriority'] != [arch]:
+            raise ValueError('Mac architecture mismatch')
+    data = path.read_bytes()
+    root = ET.Element('rss', {'version': '2.0'})
+    channel = ET.SubElement(root, 'channel')
+    ET.SubElement(channel, 'title').text = f'Fumbler for macOS ({arch})'
+    item = ET.SubElement(channel, 'item')
+    ET.SubElement(item, 'title').text = f'Fumbler {version}'
+    ET.SubElement(item, f'{{{namespace}}}version').text = version
+    ET.SubElement(item, f'{{{namespace}}}shortVersionString').text = version
+    ET.SubElement(item, f'{{{namespace}}}minimumSystemVersion').text = '13.0'
+    ET.SubElement(item, 'enclosure', {'url': base + name, 'length': str(len(data)), 'type': 'application/octet-stream', f'{{{namespace}}}edSignature': base64.b64encode(sparkle_key.sign(data)).decode()})
+    ET.ElementTree(root).write(folder / f'appcast-{arch}.xml', encoding='utf-8', xml_declaration=True)
+setups = list(folder.glob('*Setup.exe'))
+if len(setups) != 1:
+    raise ValueError('Expected one Windows installer')
+setups[0].rename(folder / f'Fumbler-{version}-windows-Setup.exe')
+files = sorted(p for p in folder.iterdir() if p.is_file())
+(folder / 'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in files))
+notes = f'''Fumbler {version} for Windows, Mac Intel, and Mac Apple silicon.
+
+Install this version once to enable future automatic updates. Updates download in the background and install when you quit Fumbler; Settings also offers Restart to update.
+
+Windows: use the Setup.exe installer. Mac: unzip and move the matching app into Applications before running it.
+
+Update packages are cryptographically authenticated. These initial installers do not yet have a commercial Windows code-signing certificate or Apple Developer ID/notarization. Your operating system may require approval on the first installation; macOS accessibility/microphone permissions may need to be granted again after an ad-hoc-signed update.
+
+Both architectures were built and ran the local self-tests in GitHub Actions. Real WhatsApp/Slack voice-note compatibility and an installed old-to-new update cycle still need device verification.
+
+Source revisions: Windows {os.environ['WINDOWS_SHA']}; macOS {os.environ['MAC_SHA']}.
+'''
+notes_path = Path('release-notes.md')
+notes_path.write_text(notes)
+existing = subprocess.run(['gh', 'release', 'view', 'v' + version, '--repo', repo, '--json', 'isDraft'], capture_output=True, text=True)
+if existing.returncode == 0:
+    if not json.loads(existing.stdout)['isDraft']:
+        raise ValueError('Refusing to overwrite a published version')
+    # A failed upload can be resumed only for this still-private draft.
+else:
+    subprocess.run(['gh', 'release', 'create', 'v' + version, '--repo', repo, '--draft', '--title', 'Fumbler ' + version, '--notes-file', str(notes_path)], check=True)
+subprocess.run(['gh', 'release', 'upload', 'v' + version, '--repo', repo, '--clobber'] + [str(p) for p in folder.iterdir() if p.is_file()], check=True)
+subprocess.run(['gh', 'release', 'edit', 'v' + version, '--repo', repo, '--draft=false', '--latest', '--notes-file', str(notes_path)], check=True)

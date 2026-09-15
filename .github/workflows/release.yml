@@ -1,0 +1,141 @@
+name: Build and publish Fumbler
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after all platform checks pass
+        type: boolean
+        default: false
+  schedule:
+    # Once a day, off the hour. GitHub drops or delays scheduled runs at peak
+    # times, and a missed daily check simply lands the next day. Note that
+    # GitHub disables schedules in a public repository after 60 days without
+    # repository activity; re-enable from the Actions tab after a quiet spell.
+    - cron: '17 6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: fumbler-stable-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || vars.RELEASE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.version.outputs.needed }}
+      version: ${{ steps.version.outputs.version }}
+      windows: ${{ steps.version.outputs.windows }}
+      mac: ${{ steps.version.outputs.mac }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: SaqibZafar/Fumbler-windows-app
+          ref: ${{ vars.WINDOWS_SOURCE_REF || 'master' }}
+          path: windows-source
+          ssh-key: ${{ secrets.WINDOWS_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: SaqibZafar/Fumbler-mac-app
+          ref: ${{ vars.MACOS_SOURCE_REF || 'master' }}
+          path: mac-source
+          ssh-key: ${{ secrets.MACOS_SOURCE_KEY }}
+          persist-credentials: false
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-release.py
+  windows:
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: SaqibZafar/Fumbler-windows-app
+          ref: ${{ needs.prepare.outputs.windows }}
+          ssh-key: ${{ secrets.WINDOWS_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build, test and package
+        shell: pwsh
+        run: |
+          # Compiler diagnostics stay on this ephemeral runner; source is private.
+          ./build.ps1 -Test *> build-log.txt
+          $test = Start-Process ./Fumbler.exe -ArgumentList '--update-self-test test-results' -WindowStyle Hidden -PassThru -Wait
+          if ($test.ExitCode -ne 0) { throw 'Updater tests failed; reproduce in the private Windows repository.' }
+          dotnet tool install --tool-path .tools/vpk vpk --version 1.2.0
+          ./package-release.ps1 -Vpk "$PWD/.tools/vpk/vpk.exe" *> package-log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            Releases/*Setup.exe
+            Releases/*full.nupkg
+            Releases/releases.win.json
+          if-no-files-found: error
+  mac:
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: apple
+            label: apple-silicon
+            arch: arm64
+          - runner: macos-15-intel
+            target: intel
+            label: intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: SaqibZafar/Fumbler-mac-app
+          ref: ${{ needs.prepare.outputs.mac }}
+          ssh-key: ${{ secrets.MACOS_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Build, test and package host architecture
+        env:
+          LABEL: ${{ matrix.label }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          bash build.sh "$TARGET" --test > build-log.txt 2>&1
+          mkdir -p Releases
+          ditto -c -k --sequesterRsrc --keepParent "build/Fumbler-$LABEL.app" "Releases/Fumbler-$VERSION-mac-$LABEL.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-release-${{ matrix.arch }}
+          path: Releases/*.zip
+          if-no-files-found: error
+  publish:
+    needs: [prepare, windows, mac]
+    if: needs.prepare.outputs.needed == 'true' && (inputs.publish || github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cryptography==46.0.3
+      - name: Sign updates and publish all platforms together
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          WINDOWS_SHA: ${{ needs.prepare.outputs.windows }}
+          MAC_SHA: ${{ needs.prepare.outputs.mac }}
+          WINDOWS_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOWS_UPDATE_PRIVATE_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: python scripts/publish.py
