@@ -94,6 +94,18 @@ jobs:
           Write-Host '===== Windows signing ====='
           $signing | ForEach-Object { Write-Host $_ }
           "signed=$(if ($signing[0] -eq 'signed') { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+      - name: Summarise the Windows checks
+        if: always()
+        shell: pwsh
+        run: |
+          # The count and the failure line, pass or fail, so the run log is the
+          # record of what this version's suite did on a machine whose clipboard
+          # and desktop are known good.
+          if (Test-Path test-results/results.txt) {
+            $lines = Get-Content test-results/results.txt
+            Write-Host ('Checks: ' + ($lines | Select-String -Pattern '^(PASS|FAIL)').Count)
+            $lines | Select-String -Pattern '^(Failures:|Elapsed:|Audio:)' | ForEach-Object { Write-Host $_.Line }
+          }
       - name: Surface failing checks
         if: failure()
         shell: pwsh
