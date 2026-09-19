@@ -50,6 +50,8 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.needed == 'true'
     runs-on: windows-2022
+    outputs:
+      signed: ${{ steps.package.outputs.signed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,14 +63,37 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - name: Build, test and package
+        id: package
         shell: pwsh
+        env:
+          # Authenticode. With WINDOWS_CODESIGN_PFX_BASE64 and its password set,
+          # package-release.ps1 imports the certificate for the duration of the
+          # build and signs Fumbler.exe, the launch stub, Velopack's Update.exe
+          # and Setup.exe before the package hashes are taken. Without them the
+          # installer is built unsigned and the run log says so; set the
+          # repository variable RELEASE_REQUIRE_SIGNING to true once a
+          # certificate exists so a missing or expired secret fails the build
+          # instead of shipping an unsigned installer.
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+          RELEASE_REQUIRE_SIGNING: ${{ vars.RELEASE_REQUIRE_SIGNING }}
         run: |
           # Compiler diagnostics stay on this ephemeral runner; source is private.
           ./build.ps1 -Test *> build-log.txt
           $test = Start-Process ./Fumbler.exe -ArgumentList '--update-self-test test-results' -WindowStyle Hidden -PassThru -Wait
           if ($test.ExitCode -ne 0) { throw 'Updater tests failed; reproduce in the private Windows repository.' }
           dotnet tool install --tool-path .tools/vpk vpk --version 1.2.0
-          ./package-release.ps1 -Vpk "$PWD/.tools/vpk/vpk.exe" *> package-log.txt
+          $require = @()
+          if ($env:RELEASE_REQUIRE_SIGNING -eq 'true') { $require = @('-RequireSignature') }
+          ./package-release.ps1 -Vpk "$PWD/.tools/vpk/vpk.exe" @require *> package-log.txt
+          # The signing record names the certificate subject and the installer's
+          # signature status, never a secret; the publish job words the release
+          # notes from it.
+          $signing = @(Get-Content Releases/windows-signing.txt)
+          Write-Host '===== Windows signing ====='
+          $signing | ForEach-Object { Write-Host $_ }
+          "signed=$(if ($signing[0] -eq 'signed') { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
       - name: Surface failing checks
         if: failure()
         shell: pwsh
@@ -85,6 +110,10 @@ jobs:
           if (Test-Path build-log.txt) {
             Write-Host '===== build-log.txt (tail) ====='
             Get-Content build-log.txt -Tail 40
+          }
+          if (Test-Path package-log.txt) {
+            Write-Host '===== package-log.txt (tail) ====='
+            Get-Content package-log.txt -Tail 40
           }
       - uses: actions/upload-artifact@v4
         with:
@@ -110,6 +139,9 @@ jobs:
             label: intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    outputs:
+      # Both slices compute the same answer; whichever finishes last wins.
+      notarized: ${{ steps.package.outputs.notarized }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,28 +149,65 @@ jobs:
           ref: ${{ needs.prepare.outputs.mac }}
           ssh-key: ${{ secrets.MACOS_SOURCE_KEY }}
           persist-credentials: false
+      - name: Import the Developer ID identity (when configured)
+        id: identity
+        env:
+          # A "Developer ID Application" certificate with its private key, as a
+          # base64 .p12 export, and that export's password. Absent, the build
+          # is signed ad hoc exactly as before and the run log says so.
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          RELEASE_REQUIRE_SIGNING: ${{ vars.RELEASE_REQUIRE_SIGNING }}
+        run: |
+          identity="$(bash import-signing-identity.sh)"
+          if [ -n "$identity" ]; then echo "Signing as $identity"; else echo "No Developer ID certificate configured; signing ad hoc."; fi
+          echo "name=$identity" >> "$GITHUB_OUTPUT"
       - name: Build, test and package host architecture
+        id: package
         env:
           LABEL: ${{ matrix.label }}
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          MACOS_SIGNING_IDENTITY: ${{ steps.identity.outputs.name }}
+          # Notarization credentials: the developer account, its team and an
+          # app-specific password. Used only when an identity was imported.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           bash build.sh "$TARGET" --test > build-log.txt 2>&1
+          app="build/Fumbler-$LABEL.app"
+          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            # Notarize and staple the bundle first, so the zip Sparkle updates
+            # from and the disk image both carry the ticket.
+            bash notarize.sh "$app"
+          fi
           # The bundle a person installs is called Fumbler.app on both
           # architectures; only the download's file name says which slice it
           # is. The zip feeds Sparkle; the disk image is what people download,
           # with an Applications shortcut beside the app so installing is one
           # drag, like any other Mac app.
           mkdir -p Releases stage
-          cp -R "build/Fumbler-$LABEL.app" stage/Fumbler.app
+          cp -R "$app" stage/Fumbler.app
           ln -s /Applications stage/Applications
           ditto -c -k --sequesterRsrc --keepParent stage/Fumbler.app "Releases/Fumbler-$VERSION-mac-$LABEL.zip"
           hdiutil create -volname "Fumbler" -srcfolder stage -ov -format UDZO "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
+          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            codesign --force --sign "$MACOS_SIGNING_IDENTITY" --timestamp "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
+            bash notarize.sh "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
+            echo "notarized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+          fi
           # Prove the image opens and holds what the instructions promise.
           mount="$(mktemp -d)"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount" "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
           test -d "$mount/Fumbler.app/Contents/MacOS" && test -L "$mount/Applications"
           "$mount/Fumbler.app/Contents/MacOS/Fumbler" --version
+          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            # Gatekeeper's own verdict on the bundle inside the image.
+            spctl --assess --type execute --verbose=2 "$mount/Fumbler.app"
+          fi
           hdiutil detach "$mount"
       - name: Summarise the macOS checks
         if: always()
@@ -181,6 +250,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           WINDOWS_SHA: ${{ needs.prepare.outputs.windows }}
           MAC_SHA: ${{ needs.prepare.outputs.mac }}
+          WINDOWS_SIGNED: ${{ needs.windows.outputs.signed }}
+          MAC_NOTARIZED: ${{ needs.mac.outputs.notarized }}
           WINDOWS_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOWS_UPDATE_PRIVATE_KEY }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: python scripts/publish.py

@@ -42,9 +42,28 @@ Velopack checks the signed package hashes. `SPARKLE_PRIVATE_KEY` signs Mac updat
 archives with Ed25519; Sparkle verifies them before extraction.
 
 These update signatures are separate from Windows Authenticode and Apple
-Developer ID/notarization. Commercial OS signing has not been configured. First
-installation may require OS approval, and ad-hoc Mac updates may require renewed
-Accessibility/Microphone permission. Do not advertise warning-free installation.
+Developer ID/notarization. The workflow signs for the operating systems only
+when the publisher credentials exist as secrets, and none of them do yet:
+
+| Secret | Used by | Effect |
+| --- | --- | --- |
+| `WINDOWS_CODESIGN_PFX_BASE64`, `WINDOWS_CODESIGN_PASSWORD` | `package-release.ps1` in the Windows source | Authenticode-signs `Fumbler.exe`, the launch stub, Velopack's `Update.exe` and `Setup.exe`, and fails the build if any executable comes out unsigned |
+| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD` | `import-signing-identity.sh` in the Mac source | Signs both bundles with the Developer ID Application identity and a secure timestamp |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | `notarize.sh` in the Mac source | Notarizes each bundle and disk image with Apple and staples the ticket |
+
+The optional repository variable `RELEASE_REQUIRE_SIGNING=true` makes a build
+without those secrets fail instead of shipping unsigned; set it once the
+certificates are in place, not before. `WINDOWS_CODESIGN_TIMESTAMP_URL` overrides
+the RFC 3161 timestamp server (DigiCert's by default). The release notes say
+which of the two was actually done for that release, from the build jobs'
+own report, never from an assumption.
+
+Until then every published installer is unsigned. First installation requires
+OS approval, ad-hoc Mac updates may require renewed Accessibility/Microphone
+permission, and antivirus heuristics can quarantine Velopack's `Update.exe`
+(Avira did, on 19 September 2026, as `Drop.Win32.RegStartupSelfDel.523`; the
+Windows source's `UPDATES.md` records what that is). Do not advertise
+warning-free installation.
 
 Keep signing-key backups secure. Replacing the keys without a transition release
 breaks updates for installed users. Never print keys, upload source archives, or

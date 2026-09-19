@@ -77,13 +77,22 @@ if len(setups) != 1:
 setups[0].rename(folder / f'Fumbler-{version}-windows-Setup.exe')
 files = sorted(p for p in folder.iterdir() if p.is_file())
 (folder / 'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in files))
+# The build jobs report whether a publisher certificate was configured. The
+# notes must say what was actually done; "signed" is never assumed.
+windows_signed = os.environ.get('WINDOWS_SIGNED') == 'true'
+mac_notarized = os.environ.get('MAC_NOTARIZED') == 'true'
+windows_note = ('The Windows installer, updater and application are Authenticode-signed.' if windows_signed
+                else 'The Windows installer is not signed with a publisher certificate: SmartScreen asks for "More info → Run anyway" on the first install, and some antivirus products quarantine the updater (Update.exe) as a heuristic false positive. Fumbler keeps working without it; only automatic updates stop until it is restored.')
+mac_note = ('The Mac apps are signed with a Developer ID and notarized by Apple.' if mac_notarized
+            else 'The Mac apps are signed ad hoc, not notarized: the first launch needs right-click → Open, and Accessibility or Microphone permission may need to be granted again after an update.')
+signing_note = 'Update packages are cryptographically authenticated. ' + windows_note + ' ' + mac_note
 notes = f'''Fumbler {version} for Windows, Mac Intel, and Mac Apple silicon.
 
 Install this version once to enable future automatic updates. Updates download in the background and install when you quit Fumbler; Settings also offers Restart to update.
 
 Windows: run the Setup.exe installer; Fumbler installs for your account, adds Start Menu and desktop shortcuts, and starts with Windows (change that in Settings → General). Mac: open the .dmg for your chip (Apple silicon or Intel), drag Fumbler into the Applications shortcut beside it, then open it from Applications; it opens at login unless you turn that off in Settings. The .zip files are what the apps update themselves from.
 
-Update packages are cryptographically authenticated. These initial installers do not yet have a commercial Windows code-signing certificate or Apple Developer ID/notarization. Your operating system may require approval on the first installation; macOS accessibility/microphone permissions may need to be granted again after an ad-hoc-signed update.
+{signing_note}
 
 Both architectures were built and ran the local self-tests in GitHub Actions. Real WhatsApp/Slack voice-note compatibility and an installed old-to-new update cycle still need device verification.
 
