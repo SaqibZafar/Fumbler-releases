@@ -124,8 +124,22 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           bash build.sh "$TARGET" --test > build-log.txt 2>&1
-          mkdir -p Releases
-          ditto -c -k --sequesterRsrc --keepParent "build/Fumbler-$LABEL.app" "Releases/Fumbler-$VERSION-mac-$LABEL.zip"
+          # The bundle a person installs is called Fumbler.app on both
+          # architectures; only the download's file name says which slice it
+          # is. The zip feeds Sparkle; the disk image is what people download,
+          # with an Applications shortcut beside the app so installing is one
+          # drag, like any other Mac app.
+          mkdir -p Releases stage
+          cp -R "build/Fumbler-$LABEL.app" stage/Fumbler.app
+          ln -s /Applications stage/Applications
+          ditto -c -k --sequesterRsrc --keepParent stage/Fumbler.app "Releases/Fumbler-$VERSION-mac-$LABEL.zip"
+          hdiutil create -volname "Fumbler" -srcfolder stage -ov -format UDZO "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
+          # Prove the image opens and holds what the instructions promise.
+          mount="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "Releases/Fumbler-$VERSION-mac-$LABEL.dmg"
+          test -d "$mount/Fumbler.app/Contents/MacOS" && test -L "$mount/Applications"
+          "$mount/Fumbler.app/Contents/MacOS/Fumbler" --version
+          hdiutil detach "$mount"
       - name: Summarise the macOS checks
         if: always()
         run: |
@@ -141,7 +155,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mac-release-${{ matrix.arch }}
-          path: Releases/*.zip
+          path: |
+            Releases/*.zip
+            Releases/*.dmg
           if-no-files-found: error
   publish:
     needs: [prepare, windows, mac]

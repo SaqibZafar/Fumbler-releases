@@ -50,13 +50,17 @@ ET.register_namespace('sparkle', namespace)
 for arch, label in [('arm64', 'apple-silicon'), ('x86_64', 'intel')]:
     name = f'Fumbler-{version}-mac-{label}.zip'
     path = folder / name
+    # The archive holds Fumbler.app (the arch is in the file name only), so an
+    # installed app is Fumbler.app whichever slice it is.
     with zipfile.ZipFile(path) as archive:
-        plist = plistlib.loads(archive.read(f'Fumbler-{label}.app/Contents/Info.plist'))
+        plist = plistlib.loads(archive.read('Fumbler.app/Contents/Info.plist'))
         if plist['CFBundleVersion'] != version or plist['SUPublicEDKey'] != sparkle_public:
             raise ValueError('Mac version or embedded signing key mismatch')
         if plist['LSArchitecturePriority'] != [arch]:
             raise ValueError('Mac architecture mismatch')
     data = path.read_bytes()
+    if not (folder / f'Fumbler-{version}-mac-{label}.dmg').is_file():
+        raise ValueError('Missing Mac disk image for ' + label)
     root = ET.Element('rss', {'version': '2.0'})
     channel = ET.SubElement(root, 'channel')
     ET.SubElement(channel, 'title').text = f'Fumbler for macOS ({arch})'
@@ -77,7 +81,7 @@ notes = f'''Fumbler {version} for Windows, Mac Intel, and Mac Apple silicon.
 
 Install this version once to enable future automatic updates. Updates download in the background and install when you quit Fumbler; Settings also offers Restart to update.
 
-Windows: use the Setup.exe installer. Mac: unzip and move the matching app into Applications before running it.
+Windows: run the Setup.exe installer; Fumbler installs for your account, adds Start Menu and desktop shortcuts, and starts with Windows (change that in Settings → General). Mac: open the .dmg for your chip (Apple silicon or Intel), drag Fumbler into the Applications shortcut beside it, then open it from Applications; it opens at login unless you turn that off in Settings. The .zip files are what the apps update themselves from.
 
 Update packages are cryptographically authenticated. These initial installers do not yet have a commercial Windows code-signing certificate or Apple Developer ID/notarization. Your operating system may require approval on the first installation; macOS accessibility/microphone permissions may need to be granted again after an ad-hoc-signed update.
 
